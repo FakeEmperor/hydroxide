@@ -18,7 +18,8 @@ import (
 	imapserver "github.com/emersion/go-imap/server"
 	"github.com/emersion/go-mbox"
 	"github.com/emersion/go-smtp"
-	"github.com/howeyc/gopass"
+	"github.com/mattn/go-isatty"
+	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/emersion/hydroxide/auth"
 	"github.com/emersion/hydroxide/carddav"
@@ -39,6 +40,33 @@ func newClient() *protonmail.Client {
 		AppVersion: "Web_3.16.65",
 		Debug:      debug,
 	}
+}
+
+func askPass(prompt string) ([]byte, error) {
+	f := os.Stdin
+	if !isatty.IsTerminal(f.Fd()) {
+		// This can happen if stdin is used for piping data
+		// TODO: the following assumes Unix
+		var err error
+		if f, err = os.Open("/dev/tty"); err != nil {
+			return nil, err
+		}
+		defer f.Close()
+	}
+	fmt.Fprintf(os.Stderr, "%v: ", prompt)
+	b, err := terminal.ReadPassword(int(f.Fd()))
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+	return b, err
+}
+
+func askBridgePass() (string, error) {
+	if v := os.Getenv("HYDROXIDE_BRIDGE_PASS"); v != "" {
+		return v, nil
+	}
+	b, err := askPass("Bridge password")
+	return string(b), err
 }
 
 func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager, tlsConfig *tls.Config) error {
@@ -147,8 +175,9 @@ Commands:
 	carddav			Run hydroxide as a CardDAV server
 	export-secret-keys <username> Export secret keys
 	imap			Run hydroxide as an IMAP server
-	import-messages <username> <file>	Import messages
+	import-messages <username> [file]	Import messages
 	export-messages [options...] <username>	Export messages
+	sendmail <username> -- <args...>	sendmail(1) interface
 	serve			Run all servers
 	smtp			Run hydroxide as an SMTP server
 	status			View hydroxide status
@@ -179,7 +208,11 @@ Global options:
 	-tls-key /path/to/key.pem
 		Path to the certificate key to use for incoming connections (Optional)
 	-tls-client-ca /path/to/ca.pem
-		If set, clients must provide a certificate signed by the given CA (Optional)`
+		If set, clients must provide a certificate signed by the given CA (Optional)
+
+Environment variables:
+	HYDROXIDE_BRIDGE_PASS	Don't prompt for the bridge password, use this variable instead
+`
 
 func main() {
 	flag.BoolVar(&debug, "debug", false, "Enable debug logs")
@@ -204,9 +237,10 @@ func main() {
 	exportSecretKeysCmd := flag.NewFlagSet("export-secret-keys", flag.ExitOnError)
 	importMessagesCmd := flag.NewFlagSet("import-messages", flag.ExitOnError)
 	exportMessagesCmd := flag.NewFlagSet("export-messages", flag.ExitOnError)
+	sendmailCmd := flag.NewFlagSet("sendmail", flag.ExitOnError)
 
 	flag.Usage = func() {
-		fmt.Println(usage)
+		fmt.Print(usage)
 	}
 
 	flag.Parse()
@@ -239,8 +273,7 @@ func main() {
 
 		var loginPassword string
 		if a == nil {
-			fmt.Printf("Password: ")
-			if pass, err := gopass.GetPasswd(); err != nil {
+			if pass, err := askPass("Password"); err != nil {
 				log.Fatal(err)
 			} else {
 				loginPassword = string(pass)
@@ -279,12 +312,11 @@ func main() {
 			mailboxPassword = loginPassword
 		}
 		if mailboxPassword == "" {
+			prompt := "Password"
 			if a.PasswordMode == protonmail.PasswordTwo {
-				fmt.Printf("Mailbox password: ")
-			} else {
-				fmt.Printf("Password: ")
+				prompt = "Mailbox password"
 			}
-			if pass, err := gopass.GetPasswd(); err != nil {
+			if pass, err := askPass(prompt); err != nil {
 				log.Fatal(err)
 			} else {
 				mailboxPassword = string(pass)
@@ -338,12 +370,9 @@ func main() {
 			log.Fatal("usage: hydroxide export-secret-keys <username>")
 		}
 
-		var bridgePassword string
-		fmt.Printf("Bridge password: ")
-		if pass, err := gopass.GetPasswd(); err != nil {
+		bridgePassword, err := askBridgePass()
+		if err != nil {
 			log.Fatal(err)
-		} else {
-			bridgePassword = string(pass)
 		}
 
 		_, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
@@ -369,22 +398,22 @@ func main() {
 		importMessagesCmd.Parse(flag.Args()[1:])
 		username := importMessagesCmd.Arg(0)
 		archivePath := importMessagesCmd.Arg(1)
-		if username == "" || archivePath == "" {
-			log.Fatal("usage: hydroxide import-messages <username> <file>")
+		if username == "" {
+			log.Fatal("usage: hydroxide import-messages <username> [file]")
 		}
 
-		f, err := os.Open(archivePath)
+		f := os.Stdin
+		if archivePath != "" {
+			f, err = os.Open(archivePath)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f.Close()
+		}
+
+		bridgePassword, err := askBridgePass()
 		if err != nil {
 			log.Fatal(err)
-		}
-		defer f.Close()
-
-		var bridgePassword string
-		fmt.Printf("Bridge password: ")
-		if pass, err := gopass.GetPasswd(); err != nil {
-			log.Fatal(err)
-		} else {
-			bridgePassword = string(pass)
 		}
 
 		c, _, err := auth.NewManager(newClient).Auth(username, bridgePassword)
@@ -424,12 +453,9 @@ func main() {
 			log.Fatal("usage: hydroxide export-messages [-conversation-id <id>] [-message-id <id>] <username>")
 		}
 
-		var bridgePassword string
-		fmt.Fprintf(os.Stderr, "Bridge password: ")
-		if pass, err := gopass.GetPasswd(); err != nil {
+		bridgePassword, err := askBridgePass()
+		if err != nil {
 			log.Fatal(err)
-		} else {
-			bridgePassword = string(pass)
 		}
 
 		c, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
@@ -492,6 +518,42 @@ func main() {
 			}()
 		}
 		log.Fatal(<-done)
+	case "sendmail":
+		username := flag.Arg(1)
+		if username == "" || flag.Arg(2) != "--" {
+			log.Fatal("usage: hydroxide sendmail <username> -- <args...>")
+		}
+
+		// TODO: other sendmail flags
+		var dotEOF bool
+		sendmailCmd.BoolVar(&dotEOF, "i", false, "don't treat a line with only a . character as the end of input")
+		sendmailCmd.Parse(flag.Args()[3:])
+		rcpt := sendmailCmd.Args()
+
+		bridgePassword, err := askBridgePass()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		c, privateKeys, err := auth.NewManager(newClient).Auth(username, bridgePassword)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		u, err := c.GetCurrentUser()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		addrs, err := c.ListAddresses()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		err = smtpbackend.SendMail(c, u, privateKeys, addrs, rcpt, os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
 	default:
 		fmt.Println(usage)
 		if cmd != "help" {
